@@ -1,41 +1,14 @@
 import torch
-from torch.utils.data import DataLoader
-from transformers import (
-    RobertaTokenizer,
-    RobertaForSequenceClassification,
-    get_linear_schedule_with_warmup,
-)
-from torch.optim import AdamW
-from datasets import load_dataset
-import numpy as np
-from peft import get_peft_model, LoraConfig, TaskType
-from utils.data_utils import *
-from models import *
-import argparse
-import warnings
-from sklearn.metrics import matthews_corrcoef
 import numpy as np
 import wandb
-from torch.cuda.amp import GradScaler, autocast
+from tqdm.auto import tqdm
 from sklearn.metrics import matthews_corrcoef, f1_score, accuracy_score
 from scipy.stats import pearsonr, spearmanr
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-import torch
-from datasets import load_dataset
+from torch.cuda.amp import GradScaler, autocast
 from transformers import get_linear_schedule_with_warmup
-from transformers import GPT2LMHeadModel
-from peft import get_peft_model, LoraConfig, TaskType
-from transformers import Trainer, TrainingArguments
-from utils.data_utils import *
-import os
-from copy import deepcopy
 
 
 def train_client(model, dataloader, optimizer, scheduler, args):
-
     scaler = GradScaler()
     model.train()
 
@@ -84,7 +57,6 @@ def calculate_metrics(all_true_labels, all_predictions, task):
 
 
 def evaluate_glue(model, dataloader, args, max_metric1, max_metric2):
-
     model.eval()
     eval_loss = 0
     all_predictions = []
@@ -93,9 +65,7 @@ def evaluate_glue(model, dataloader, args, max_metric1, max_metric2):
     for batch in dataloader:
         batch = {k: v.to(args.device) for k, v in batch.items()}
         with torch.no_grad():
-
             outputs = model(**batch)
-
             eval_loss += outputs.loss.detach().cpu().numpy()
 
             if args.task == "stsb":
@@ -107,7 +77,6 @@ def evaluate_glue(model, dataloader, args, max_metric1, max_metric2):
 
     eval_loss /= len(dataloader)
 
-    # Calculate the metrics for the specific task
     metric1, metric2 = calculate_metrics(all_true_labels, all_predictions, args.task)
 
     if metric1 > max_metric1:
@@ -123,15 +92,13 @@ def evaluate_glue(model, dataloader, args, max_metric1, max_metric2):
     if max_metric2 is not None:
         print(f"{args.task} - Max Metric 2: {max_metric2:.4f}")
 
-    wandb.log(
-        {
-            f"eval_loss": eval_loss,
-            f"metric1": metric1,
-            f"metric2": metric2 if metric2 is not None else 0,
-            f"max_metric1": max_metric1,
-            f"max_metric2": max_metric2 if max_metric2 is not None else 0,
-        }
-    )
+    wandb.log({
+        f"eval_loss": eval_loss,
+        f"metric1": metric1,
+        f"metric2": metric2 if metric2 is not None else 0,
+        f"max_metric1": max_metric1,
+        f"max_metric2": max_metric2 if max_metric2 is not None else 0,
+    })
 
     return max_metric1, max_metric2
 
@@ -142,4 +109,3 @@ def get_lr_scheduler(optimizer, num_warmup_steps, num_training_steps):
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps,
     )
-
