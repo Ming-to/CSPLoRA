@@ -11,6 +11,10 @@ def get_arithmetic_args():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
 
+    # LoRA+ 专用参数
+    parser.add_argument("--lora_plus_lr_ratio", type=float, default=16.0,
+                        help="LoRA+ 中 LoRA A 矩阵相对于 B 的学习率放大倍率 η = lr_A / lr_B")
+
     # CSPLoRA
     parser.add_argument("--csplora", action="store_true")
     parser.add_argument("--csplora_rho", type=float, default=0.9)
@@ -87,6 +91,10 @@ def get_cr_args():
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # LoRA+ 专用参数
+    parser.add_argument("--lora_plus_lr_ratio", type=float, default=16.0,
+                        help="LoRA+ 中 LoRA A 矩阵相对于 B 的学习率放大倍率 η = lr_A / lr_B")
 
     # CSPLoRA
     parser.add_argument("--csplora", action="store_true")

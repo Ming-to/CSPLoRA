@@ -8,7 +8,63 @@ import transformers
 from transformers import TrainingArguments, Trainer
 from peft import TaskType
 
+import bitsandbytes as bnb
 import wandb
+
+
+class LoRAPlusTrainer(Trainer):
+    """Custom Trainer that supports LoRA+ learning rate differentiation.
+
+    LoRA+ uses different learning rates for lora_A and lora_B matrices:
+    - lora_A: lr * lora_plus_lr_ratio (default 16x)
+    - lora_B: lr (base learning rate)
+    """
+
+    def __init__(self, *args, lora_plus_lr_ratio: float = 16.0, **kwargs):
+        self.lora_plus_lr_ratio = lora_plus_lr_ratio
+        super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        """Create optimizer with different learning rates for LoRA A/B matrices."""
+        if self.optimizer is not None:
+            return self.optimizer
+
+        # Separate parameters into groups
+        lora_A_params = []
+        lora_B_params = []
+        other_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "lora_A" in name:
+                lora_A_params.append(param)
+            elif "lora_B" in name:
+                lora_B_params.append(param)
+            else:
+                other_params.append(param)
+
+        lr_B = self.args.learning_rate
+        lr_A = lr_B * self.lora_plus_lr_ratio
+
+        # Build parameter groups
+        param_groups = []
+        if other_params:
+            param_groups.append({"params": other_params, "lr": lr_B})
+        if lora_A_params:
+            param_groups.append({"params": lora_A_params, "lr": lr_A})
+        if lora_B_params:
+            param_groups.append({"params": lora_B_params, "lr": lr_B})
+
+        # Use 8-bit AdamW to match the default behavior
+        self.optimizer = bnb.optim.AdamW8bit(
+            param_groups,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+            eps=self.args.adam_epsilon,
+            weight_decay=self.args.weight_decay,
+        )
+
+        return self.optimizer
 
 from utils.data_utils import load_and_preprocess_cr
 from models import create_model_tokenizer_cr, create_peft_model_cr, _get_llama_target_modules
@@ -314,11 +370,24 @@ def finetune(args):
     with open(os.path.join(run_dir, "training_args.json"), "w") as f:
         json.dump(training_args.to_dict(), f, indent=4)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        **data_module,
-    )
+    # Use LoRAPlusTrainer for lora_plus method, standard Trainer otherwise
+    if method in ["lora_plus", "lora+"]:
+        lora_plus_lr_ratio = getattr(args, "lora_plus_lr_ratio", 16.0)
+        if is_main_process:
+            print(f"[LoRA+] Using LoRAPlusTrainer with lr_ratio={lora_plus_lr_ratio}")
+            print(f"[LoRA+] lora_A lr={args.lr * lora_plus_lr_ratio}, lora_B lr={args.lr}")
+        trainer = LoRAPlusTrainer(
+            model=model,
+            args=training_args,
+            lora_plus_lr_ratio=lora_plus_lr_ratio,
+            **data_module,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            **data_module,
+        )
 
     if is_main_process:
         tokenizer.save_pretrained(os.path.join(run_dir, "tokenizer"))
