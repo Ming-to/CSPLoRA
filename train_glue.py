@@ -89,6 +89,11 @@ def finetune(task):
                 r_min=getattr(args, "csplora_r_min", 2),
                 r_max_factor=getattr(args, "csplora_r_max_factor", 4.0),
                 gamma=getattr(args, "csplora_gamma", 2.0),
+                gamma_strategy=getattr(args, "csplora_gamma_strategy", "fixed"),
+                gamma_scale=getattr(args, "csplora_gamma_scale", 1.0),
+                gamma_max=getattr(args, "csplora_gamma_max", 10.0),
+                gamma_min_std=getattr(args, "csplora_gamma_min_std", 1e-4),
+                causal_confidence_weighting=not getattr(args, "csplora_no_causal_weighting", False),
                 tau_scale=getattr(args, "csplora_tau_scale", 1.0),
                 skip_smooth=getattr(args, "csplora_skip_smooth", False),
                 skip_normalize=getattr(args, "csplora_skip_normalize", False),
@@ -120,6 +125,8 @@ def finetune(task):
                     "ada_actual_probe_steps": stats.get('actual_probe_steps', -1),
                     "ada_converged": stats.get('converged', False),
                     "ada_final_rho": stats.get('final_rho', -1),
+                    "csplora_gamma_eff_mean": stats.get('gamma_eff_mean', 0),
+                    "csplora_weighted_batch_count": stats.get('weighted_batch_count', 0),
                 })
 
             if layer_ranks:

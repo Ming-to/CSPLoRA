@@ -40,6 +40,12 @@ def get_glue_args():
     parser.add_argument("--csplora_R_tot", type=int, default=-1)
     parser.add_argument("--csplora_rho", type=float, default=1.0)
     parser.add_argument("--csplora_gamma", type=float, default=1.0)
+    parser.add_argument("--csplora_gamma_strategy", type=str, default="fixed",
+                        choices=["none", "uniform", "fixed", "adaptive_std"])
+    parser.add_argument("--csplora_gamma_scale", type=float, default=1.0)
+    parser.add_argument("--csplora_gamma_max", type=float, default=10.0)
+    parser.add_argument("--csplora_gamma_min_std", type=float, default=1e-4)
+    parser.add_argument("--csplora_no_causal_weighting", action="store_true")
     parser.add_argument("--csplora_r_min", type=int, default=2)
     parser.add_argument("--csplora_r_max_factor", type=float, default=4.0)
     parser.add_argument("--csplora_tau_scale", type=float, default=1.0)

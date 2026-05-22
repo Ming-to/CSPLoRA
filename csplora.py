@@ -26,6 +26,11 @@ class CSpLoRAConfig:
     cache_dir: str
 
     gamma: float = 1.0
+    gamma_strategy: str = "fixed"  # none/uniform, fixed, adaptive_std
+    gamma_scale: float = 1.0
+    gamma_max: float = 10.0
+    gamma_min_std: float = 1e-4
+    causal_confidence_weighting: bool = True
     r_base: int = 8
     r_min: int = 2
     r_max_factor: float = 4.0
@@ -81,8 +86,28 @@ class CSpLoRAPlanner:
         safe_model_id = raw_id.replace("/", "_").replace(":", "_")
 
         metric_suffix = f"_{cfg.importance_metric}" if cfg.importance_metric != "taylor" else ""
-        fname = f"{cfg.task_name}_ada_scores{metric_suffix}.json"
+        gamma_suffix = self._gamma_cache_suffix()
+        fname = f"{cfg.task_name}_ada_scores{metric_suffix}{gamma_suffix}.json"
         self.cache_path = os.path.join(cfg.cache_dir, safe_model_id, fname)
+
+    @staticmethod
+    def _slug_float(value: float) -> str:
+        text = f"{float(value):g}"
+        return text.replace("-", "m").replace(".", "p")
+
+    def _gamma_cache_suffix(self) -> str:
+        strategy = str(getattr(self.cfg, "gamma_strategy", "fixed")).lower()
+        if strategy in {"none", "uniform"}:
+            return "_guniform"
+        if strategy == "fixed":
+            return f"_gfixed{self._slug_float(getattr(self.cfg, 'gamma', 0.0))}"
+        if strategy == "adaptive_std":
+            scale = self._slug_float(getattr(self.cfg, "gamma_scale", 1.0))
+            gmax = self._slug_float(getattr(self.cfg, "gamma_max", 10.0))
+            minstd = self._slug_float(getattr(self.cfg, "gamma_min_std", 1e-4))
+            return f"_gadaptstd_s{scale}_m{gmax}_n{minstd}"
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", strategy)
+        return f"_g{safe}"
 
     def plan(self, base_model: nn.Module, probe_dataloader) -> Tuple[Dict[str, int], Dict[str, float]]:
         scores = self._try_load_scores()
@@ -150,6 +175,12 @@ class CSpLoRAPlanner:
         ranking_history: List[List[str]] = []
         stable_count = 0
 
+        gamma_eff_history: List[float] = []
+        ess_ratio_history: List[float] = []
+        difficulty_mean_history: List[float] = []
+        difficulty_std_history: List[float] = []
+        weighted_batch_count = 0
+
         min_steps = cfg.min_probe_steps if cfg.adaptive_steps else cfg.max_probe_steps_legacy
         max_steps = cfg.max_probe_steps if cfg.adaptive_steps else cfg.max_probe_steps_legacy
         patience = cfg.step_patience
@@ -171,30 +202,20 @@ class CSpLoRAPlanner:
                     break
 
                 batch = {k: v.to(cfg.device) for k, v in batch.items()}
-                labels = batch.get("labels", batch["input_ids"].clone())
 
                 probe_model.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     outputs = probe_model(**batch)
-                    logits = outputs.logits
-
-                    if logits.dim() == 2 and logits.size(-1) == 1:
-                        loss = F.mse_loss(logits.squeeze(-1), labels.to(dtype=logits.dtype), reduction="mean")
-                    elif logits.dim() == 2:
-                        probs = logits.softmax(dim=-1)
-                        label_idx = labels.to(dtype=torch.long).clamp(min=0, max=probs.size(-1) - 1)
-                        conf = probs[torch.arange(logits.size(0), device=logits.device), label_idx]
-                        difficulty = 1.0 - conf
-                        loss_i = F.cross_entropy(logits, labels, reduction="none")
-                        if cfg.gamma > 0:
-                            w = torch.softmax(cfg.gamma * difficulty, dim=0)
-                            loss = (w * loss_i).mean()
-                        else:
-                            loss = loss_i.mean()
-                    else:
-                        loss = outputs.loss
+                    loss, weight_stats = self._compute_probe_loss(outputs, batch)
 
                 loss.backward()
+
+                if weight_stats:
+                    gamma_eff_history.append(float(weight_stats.get("gamma_eff", 0.0)))
+                    ess_ratio_history.append(float(weight_stats.get("ess_ratio", 1.0)))
+                    difficulty_mean_history.append(float(weight_stats.get("difficulty_mean", 0.0)))
+                    difficulty_std_history.append(float(weight_stats.get("difficulty_std", 0.0)))
+                    weighted_batch_count += int(weight_stats.get("used_confidence_weighting", 0.0) > 0)
 
                 for name, param in group:
                     if param.grad is None:
@@ -280,6 +301,8 @@ class CSpLoRAPlanner:
                             print(f"[CSPLoRA] Converged at step {step_count}")
                             break
 
+        probe_model.zero_grad(set_to_none=True)
+
         if cfg.probe_checkpoint and not prev_gc:
             self._toggle_gradient_checkpointing(probe_model, False)
 
@@ -301,9 +324,180 @@ class CSpLoRAPlanner:
             'actual_probe_steps': step_count,
             'converged': converged,
             'convergence_step': convergence_step,
+            'gamma_strategy': str(getattr(cfg, 'gamma_strategy', 'fixed')),
+            'gamma_scale': float(getattr(cfg, 'gamma_scale', 1.0)),
+            'gamma_max': float(getattr(cfg, 'gamma_max', 10.0)),
+            'gamma_min_std': float(getattr(cfg, 'gamma_min_std', 1e-4)),
+            'causal_confidence_weighting': bool(getattr(cfg, 'causal_confidence_weighting', True)),
+            'weighted_batch_count': int(weighted_batch_count),
+            'gamma_eff_mean': float(sum(gamma_eff_history) / len(gamma_eff_history)) if gamma_eff_history else 0.0,
+            'gamma_eff_max': float(max(gamma_eff_history)) if gamma_eff_history else 0.0,
+            'gamma_eff_min': float(min(gamma_eff_history)) if gamma_eff_history else 0.0,
+            'ess_ratio_mean': float(sum(ess_ratio_history) / len(ess_ratio_history)) if ess_ratio_history else 1.0,
+            'difficulty_mean_avg': float(sum(difficulty_mean_history) / len(difficulty_mean_history)) if difficulty_mean_history else 0.0,
+            'difficulty_std_avg': float(sum(difficulty_std_history) / len(difficulty_std_history)) if difficulty_std_history else 0.0,
         }
 
         return scores, stats
+
+    def _compute_probe_loss(self, outputs, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        cfg = self.cfg
+        logits = outputs.logits
+        labels = batch.get("labels", batch.get("input_ids"))
+
+        if logits.dim() == 2 and logits.size(-1) == 1:
+            loss = F.mse_loss(logits.squeeze(-1), labels.to(dtype=logits.dtype), reduction="mean")
+            return loss, {}
+
+        if logits.dim() == 2:
+            loss_i = F.cross_entropy(logits, labels, reduction="none")
+            probs = logits.softmax(dim=-1)
+            label_idx = labels.to(dtype=torch.long).view(-1).clamp(min=0, max=probs.size(-1) - 1)
+            conf = probs[torch.arange(logits.size(0), device=logits.device), label_idx]
+            difficulty = 1.0 - conf
+            weights, stats = self._compute_batch_weights(difficulty)
+            if weights is None:
+                return loss_i.mean(), stats
+            return (weights * loss_i).sum(), stats
+
+        if logits.dim() == 3 and getattr(cfg, "causal_confidence_weighting", True):
+            if cfg.task_type == TaskType.SEQ_2_SEQ_LM:
+                return self._compute_seq2seq_weighted_loss(logits, labels, outputs.loss)
+            return self._compute_causal_lm_weighted_loss(logits, labels, outputs.loss)
+
+        return outputs.loss, {
+            "gamma_strategy": str(getattr(cfg, "gamma_strategy", "fixed")),
+            "gamma_eff": 0.0,
+            "ess_ratio": 1.0,
+            "difficulty_mean": 0.0,
+            "difficulty_std": 0.0,
+            "used_confidence_weighting": 0.0,
+        }
+
+    def _compute_seq2seq_weighted_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        fallback_loss: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        valid_mask = labels.ne(-100)
+        if valid_mask.sum().item() == 0:
+            return fallback_loss, self._uniform_weight_stats()
+
+        vocab_size = logits.size(-1)
+        flat_loss = F.cross_entropy(
+            logits.view(-1, vocab_size),
+            labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        )
+        token_loss = flat_loss.view_as(labels)
+        token_counts = valid_mask.sum(dim=1).clamp_min(1)
+        sample_loss = (token_loss * valid_mask).sum(dim=1) / token_counts
+
+        probs = logits.softmax(dim=-1)
+        safe_labels = labels.clamp_min(0)
+        token_conf = probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+        token_conf = token_conf * valid_mask
+        sample_conf = token_conf.sum(dim=1) / token_counts
+        difficulty = 1.0 - sample_conf
+
+        weights, stats = self._compute_batch_weights(difficulty)
+        if weights is None:
+            return sample_loss.mean(), stats
+        return (weights * sample_loss).sum(), stats
+
+    def _compute_causal_lm_weighted_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        fallback_loss: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        valid_mask = shift_labels.ne(-100)
+        if valid_mask.sum().item() == 0:
+            return fallback_loss, self._uniform_weight_stats()
+
+        vocab_size = shift_logits.size(-1)
+        flat_loss = F.cross_entropy(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        )
+        token_loss = flat_loss.view_as(shift_labels)
+        token_counts = valid_mask.sum(dim=1).clamp_min(1)
+        sample_loss = (token_loss * valid_mask).sum(dim=1) / token_counts
+
+        probs = shift_logits.softmax(dim=-1)
+        safe_labels = shift_labels.clamp_min(0)
+        token_conf = probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+        token_conf = token_conf * valid_mask
+        sample_conf = token_conf.sum(dim=1) / token_counts
+        difficulty = 1.0 - sample_conf
+
+        weights, stats = self._compute_batch_weights(difficulty)
+        if weights is None:
+            return sample_loss.mean(), stats
+        return (weights * sample_loss).sum(), stats
+
+    def _uniform_weight_stats(self) -> Dict[str, float]:
+        return {
+            "gamma_strategy": str(getattr(self.cfg, "gamma_strategy", "fixed")),
+            "gamma_eff": 0.0,
+            "ess_ratio": 1.0,
+            "difficulty_mean": 0.0,
+            "difficulty_std": 0.0,
+            "used_confidence_weighting": 0.0,
+        }
+
+    def _compute_batch_weights(self, difficulty: torch.Tensor) -> Tuple[torch.Tensor | None, Dict[str, float]]:
+        cfg = self.cfg
+        batch_size = int(difficulty.numel())
+        difficulty_mean = float(difficulty.mean().item()) if batch_size > 0 else 0.0
+        difficulty_std = float(difficulty.std(unbiased=False).item()) if batch_size > 1 else 0.0
+
+        if batch_size <= 1:
+            stats = self._uniform_weight_stats()
+            stats.update({"difficulty_mean": difficulty_mean, "difficulty_std": difficulty_std})
+            return None, stats
+
+        strategy = str(getattr(cfg, "gamma_strategy", "fixed")).lower()
+        if strategy in {"none", "uniform"}:
+            stats = self._uniform_weight_stats()
+            stats.update({"gamma_strategy": strategy, "difficulty_mean": difficulty_mean, "difficulty_std": difficulty_std})
+            return None, stats
+
+        if strategy == "fixed":
+            gamma_eff = max(float(getattr(cfg, "gamma", 0.0)), 0.0)
+            if gamma_eff <= 0:
+                stats = self._uniform_weight_stats()
+                stats.update({"gamma_strategy": strategy, "difficulty_mean": difficulty_mean, "difficulty_std": difficulty_std})
+                return None, stats
+            logits_for_weights = difficulty
+        elif strategy == "adaptive_std":
+            centered = difficulty - difficulty.mean()
+            scale = float(centered.std(unbiased=False).item()) if batch_size > 1 else 0.0
+            if scale < float(getattr(cfg, "gamma_min_std", 1e-4)):
+                stats = self._uniform_weight_stats()
+                stats.update({"gamma_strategy": strategy, "difficulty_mean": difficulty_mean, "difficulty_std": difficulty_std})
+                return None, stats
+            gamma_eff = min(float(getattr(cfg, "gamma_scale", 1.0)) / scale, float(getattr(cfg, "gamma_max", 10.0)))
+            logits_for_weights = centered
+        else:
+            raise ValueError(f"Unsupported gamma strategy: {getattr(cfg, 'gamma_strategy', strategy)}")
+
+        weights = torch.softmax(gamma_eff * logits_for_weights, dim=0)
+        ess = 1.0 / max((weights * weights).sum().item(), 1e-12)
+        return weights, {
+            "gamma_strategy": strategy,
+            "gamma_eff": float(gamma_eff),
+            "ess_ratio": float(ess / float(batch_size)),
+            "difficulty_mean": difficulty_mean,
+            "difficulty_std": difficulty_std,
+            "used_confidence_weighting": 1.0,
+        }
 
     def _compute_adaptive_rho(self, scores: Dict[str, float]) -> float:
         cfg = self.cfg
@@ -593,6 +787,17 @@ class CSpLoRAPlanner:
 
     def _save_scores(self, scores: Dict[str, float]) -> None:
         data = {
+            "meta": {
+                "model": self.cfg.model_id,
+                "task": self.cfg.task_name,
+                "importance_metric": self.cfg.importance_metric,
+                "gamma_strategy": str(getattr(self.cfg, "gamma_strategy", "fixed")),
+                "gamma": float(getattr(self.cfg, "gamma", 0.0)),
+                "gamma_scale": float(getattr(self.cfg, "gamma_scale", 1.0)),
+                "gamma_max": float(getattr(self.cfg, "gamma_max", 10.0)),
+                "gamma_min_std": float(getattr(self.cfg, "gamma_min_std", 1e-4)),
+                "causal_confidence_weighting": bool(getattr(self.cfg, "causal_confidence_weighting", True)),
+            },
             "scores": scores,
             "layer_capacity": self.layer_capacity,
             "adaptive_stats": self.adaptive_stats,
